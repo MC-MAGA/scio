@@ -18,67 +18,167 @@
 package com.spotify.scio.values
 
 import com.spotify.scio.ScioContext
-import com.spotify.scio.coders.{Beam, MaterializedCoder}
+import com.spotify.scio.coders.instances.ZstdCoder
+import com.spotify.scio.coders.{Beam, Coder, MaterializedCoder}
 import com.spotify.scio.testing.PipelineSpec
 import com.spotify.scio.util.random.RandomSamplerUtils
 import com.spotify.scio.hash._
 import com.spotify.scio.options.ScioOptions
 import com.twitter.algebird.Aggregator
 import magnolify.guava.auto._
-import org.apache.beam.sdk.coders.{NullableCoder, StringUtf8Coder, StructuredCoder, VarIntCoder}
+import org.apache.beam.sdk.coders.{
+  Coder => BCoder,
+  KvCoder,
+  NullableCoder,
+  StringUtf8Coder,
+  StructuredCoder,
+  VarIntCoder,
+  ZstdCoder => BZstdCoder
+}
+import org.joda.time.Instant
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
+import scala.reflect.ClassTag
 
 class PairSCollectionFunctionsTest extends PipelineSpec {
+  trait Cast[T] {
+    val value: T
+    def as[U: ClassTag]: U = {
+      value shouldBe a[U]
+      value.asInstanceOf[U]
+    }
+  }
+  implicit class ScioCoderCast[T](val value: Coder[T]) extends Cast[Coder[T]]
+  implicit class BeamCoderCast[T](val value: BCoder[T]) extends Cast[BCoder[T]]
+  implicit class StructuredDestructure[T](value: StructuredCoder[T]) {
+    def components: List[BCoder[_]] = value.getComponents.asScala.toList
+      .asInstanceOf[List[BCoder[_]]]
+
+    def tuple2(fn: (BCoder[_], BCoder[_]) => Any) = {
+      components match {
+        case keyCoder :: valueCoder :: Nil => fn(keyCoder, valueCoder)
+        case _                             => throw new IllegalStateException()
+      }
+    }
+
+    def shouldHaveKey[K: ClassTag] = {
+      tuple2 { case (keyCoder, _) => keyCoder shouldBe a[K] }
+      value
+    }
+
+    def shouldHaveValue[V: ClassTag] = {
+      tuple2 { case (_, valueCoder) => valueCoder shouldBe a[V] }
+      value
+    }
+  }
+
   "PairSCollection" should "propagates unwrapped coders" in {
     val sc = ScioContext()
     val coll = sc.empty[(String, Int)]()
-    // internal is wrapped
-    val internalCoder = coll.internal.getCoder
-    internalCoder shouldBe a[MaterializedCoder[_]]
-    val materializedCoder = internalCoder.asInstanceOf[MaterializedCoder[_]]
-    materializedCoder.bcoder shouldBe a[StructuredCoder[_]]
-    val tupleCoder = materializedCoder.bcoder.asInstanceOf[StructuredCoder[_]]
-    val keyCoder = tupleCoder.getComponents.get(0)
-    keyCoder shouldBe StringUtf8Coder.of()
-    val valueCoder = tupleCoder.getComponents.get(1)
-    valueCoder shouldBe VarIntCoder.of()
-    // implicit SCollection key and value coder aren't
-    coll.keyCoder shouldBe a[Beam[_]]
-    val beamKeyCoder = coll.keyCoder.asInstanceOf[Beam[_]]
-    beamKeyCoder.beam shouldBe StringUtf8Coder.of()
 
-    coll.valueCoder shouldBe a[Beam[_]]
-    val beamValueCoder = coll.valueCoder.asInstanceOf[Beam[_]]
-    beamValueCoder.beam shouldBe VarIntCoder.of()
+    // internal is wrapped
+    coll.internal.getCoder
+      .as[MaterializedCoder[_]]
+      .bcoder
+      .as[StructuredCoder[_]]
+      .tuple2 { case (keyCoder, valueCoder) =>
+        keyCoder shouldBe StringUtf8Coder.of()
+        valueCoder shouldBe VarIntCoder.of()
+      }
+
+    // implicit SCollection key and value coder aren't
+    coll.keyCoder.as[Beam[_]].beam shouldBe StringUtf8Coder.of()
+    coll.valueCoder.as[Beam[_]].beam shouldBe VarIntCoder.of()
   }
 
   it should "propagate unwrapped nullable coders" in {
     val sc = ScioContext()
     sc.optionsAs[ScioOptions].setNullableCoders(true)
-
     val coll = sc.empty[(String, Int)]()
-    // internal is wrapped
-    val internalCoder = coll.internal.getCoder
-    internalCoder shouldBe a[MaterializedCoder[_]]
-    val materializedCoder = internalCoder.asInstanceOf[MaterializedCoder[_]]
-    materializedCoder.bcoder shouldBe a[NullableCoder[_]]
-    val nullableTupleCoder = materializedCoder.bcoder.asInstanceOf[NullableCoder[_]]
-    val tupleCoder = nullableTupleCoder.getValueCoder.asInstanceOf[StructuredCoder[_]]
-    val keyCoder = tupleCoder.getComponents.get(0)
-    keyCoder shouldBe a[NullableCoder[_]]
-    keyCoder.asInstanceOf[NullableCoder[_]].getValueCoder shouldBe StringUtf8Coder.of()
-    val valueCoder = tupleCoder.getComponents.get(1)
-    valueCoder shouldBe a[NullableCoder[_]]
-    valueCoder.asInstanceOf[NullableCoder[_]].getValueCoder shouldBe VarIntCoder.of()
-    // implicit SCollection key and value coder aren't
-    coll.keyCoder shouldBe a[Beam[_]]
-    val beamKeyCoder = coll.keyCoder.asInstanceOf[Beam[_]]
-    beamKeyCoder.beam shouldBe StringUtf8Coder.of()
 
-    coll.valueCoder shouldBe a[Beam[_]]
-    val beamValueCoder = coll.valueCoder.asInstanceOf[Beam[_]]
-    beamValueCoder.beam shouldBe VarIntCoder.of()
+    // internal is wrapped
+    coll.internal.getCoder
+      .as[MaterializedCoder[_]]
+      .bcoder
+      .as[NullableCoder[_]]
+      .getValueCoder
+      .as[StructuredCoder[_]]
+      .tuple2 { case (keyCoder, valueCoder) =>
+        keyCoder.as[NullableCoder[_]].getValueCoder shouldBe StringUtf8Coder.of()
+        valueCoder.as[NullableCoder[_]].getValueCoder shouldBe VarIntCoder.of()
+      }
+
+    // implicit SCollection key and value coder aren't
+    coll.keyCoder.as[Beam[_]].beam shouldBe StringUtf8Coder.of()
+    coll.valueCoder.as[Beam[_]].beam shouldBe VarIntCoder.of()
+  }
+
+  it should "apply and propagate zstd coders" in {
+    def tuple2[K, V](scoll: SCollection[(K, V)]) = {
+      scoll.internal.getCoder
+        .as[MaterializedCoder[_]]
+        .bcoder
+        .as[StructuredCoder[_]]
+    }
+
+    val sc = ScioContext()
+    val dictBytes = Array[Byte](0, 1, 2, 3, 4, 5)
+
+    // don't die when extracting underlying coders
+    val tupleDictColl = sc
+      .empty[(String, String)]()(ZstdCoder(dictBytes))
+    noException shouldBe thrownBy {
+      tupleDictColl.keyCoder
+      tupleDictColl.valueCoder
+    }
+
+    val coll = sc
+      .empty[String]()(ZstdCoder(dictBytes))
+
+    // zstd should be applied
+    coll.internal.getCoder.as[MaterializedCoder[_]].bcoder shouldBe a[BZstdCoder[_]]
+
+    val keyed = coll.keyBy(_.substring(0, 1))
+
+    // zstd should survive key operation on value side
+    tuple2(keyed)
+      .shouldHaveKey[StringUtf8Coder]
+      .shouldHaveValue[BZstdCoder[_]]
+
+    // zstd should survive conversion to KV
+    keyed.toKV.internal.getCoder
+      .as[KvCoder[_, _]]
+      .getValueCoder
+      .as[MaterializedCoder[_]]
+      .bcoder shouldBe a[BZstdCoder[_]]
+
+    val tupleValueZstd = sc
+      .empty[(String, String)]()(ZstdCoder.tuple2(valueDict = dictBytes))
+
+    // zstd should be applied to value side only
+    tuple2(tupleValueZstd)
+      .shouldHaveKey[StringUtf8Coder]
+      .shouldHaveValue[BZstdCoder[_]]
+
+    val tupleKVZstd = sc
+      .empty[(String, String)]()(ZstdCoder.tuple2(dictBytes, dictBytes))
+
+    // zstd should be applied to both sides
+    tuple2(tupleKVZstd)
+      .shouldHaveKey[BZstdCoder[_]]
+      .shouldHaveValue[BZstdCoder[_]]
+
+    // transforming key should drop Zstd on key side but not value side
+    tuple2(tupleKVZstd.mapKeys(_.substring(0, 1)))
+      .shouldHaveKey[StringUtf8Coder]
+      .shouldHaveValue[BZstdCoder[_]]
+
+    // transforming value should drop Zstd on value side but not key side
+    tuple2(tupleKVZstd.mapValues(_.substring(0, 1)))
+      .shouldHaveKey[BZstdCoder[_]]
+      .shouldHaveValue[StringUtf8Coder]
+
   }
 
   it should "support cogroup()" in {
@@ -392,6 +492,17 @@ class PairSCollectionFunctionsTest extends PipelineSpec {
     }
   }
 
+  it should "support withTimestampedValues" in {
+    runWithContext { sc =>
+      val p = sc.parallelizeTimestamped(
+        Seq(("a", 1), ("b", 2), ("c", 3)),
+        Seq(1L, 2L, 3L).map(new Instant(_))
+      )
+      val r = p.withTimestampedValues.map { case (k, (v, ts)) => (k, v, ts.getMillis) }
+      r should containInAnyOrder(Seq(("a", 1, 1L), ("b", 2, 2L), ("c", 3, 3L)))
+    }
+  }
+
   it should "support filterValues()" in {
     runWithContext { sc =>
       val p = sc
@@ -602,19 +713,66 @@ class PairSCollectionFunctionsTest extends PipelineSpec {
     }
   }
 
-  it should "support maxByKey()" in {
+  it should "support minByKey()" in {
     runWithContext { sc =>
-      val p =
-        sc.parallelize(Seq(("a", 1), ("a", 10), ("b", 2), ("b", 20))).maxByKey
-      p should containInAnyOrder(Seq(("a", 10), ("b", 20)))
+      def minByKey(elems: (String, Int)*): SCollection[(String, Int)] =
+        sc.parallelize(elems).minByKey
+
+      minByKey() should beEmpty
+      minByKey(("a", 1), ("a", 10), ("b", 2), ("b", 20)) should containInAnyOrder(
+        Seq(("a", 1), ("b", 2))
+      )
     }
   }
 
-  it should "support minByKey()" in {
+  it should "support maxByKey()" in {
     runWithContext { sc =>
-      val p =
-        sc.parallelize(Seq(("a", 1), ("a", 10), ("b", 2), ("b", 20))).minByKey
-      p should containInAnyOrder(Seq(("a", 1), ("b", 2)))
+      def maxByKey(elems: (String, Int)*): SCollection[(String, Int)] =
+        sc.parallelize(elems).maxByKey
+
+      maxByKey() should beEmpty
+      maxByKey(("a", 1), ("a", 10), ("b", 2), ("b", 20)) should containInAnyOrder(
+        Seq(("a", 10), ("b", 20))
+      )
+    }
+  }
+
+  it should "support latestByKey()" in {
+    runWithContext { sc =>
+      def latestByKey(elems: (String, Int)*): SCollection[(String, Int)] =
+        sc
+          .parallelize(elems)
+          .timestampBy { case (_, v) => Instant.ofEpochMilli(v.toLong) }
+          .latestByKey
+
+      latestByKey() should beEmpty
+      latestByKey(("a", 1), ("a", 10), ("b", 2), ("b", 20)) should containInAnyOrder(
+        Seq(("a", 10), ("b", 20))
+      )
+    }
+  }
+
+  it should "support sumByKey" in {
+    runWithContext { sc =>
+      def sumByKey(elems: (String, Int)*): SCollection[(String, Int)] =
+        sc.parallelize(elems).sumByKey
+
+      sumByKey() should beEmpty
+      sumByKey(
+        Seq(("a", 1), ("b", 2), ("b", 2)) ++ (1 to 100).map(("c", _)): _*
+      ) should containInAnyOrder(Seq(("a", 1), ("b", 4), ("c", 5050)))
+    }
+  }
+
+  it should "support meanByKey" in {
+    runWithContext { sc =>
+      def meanByKey(elems: (String, Int)*): SCollection[(String, Double)] =
+        sc.parallelize(elems).meanByKey
+
+      meanByKey() should beEmpty
+      meanByKey(
+        Seq(("a", 1), ("b", 2), ("b", 3)) ++ (0 to 100).map(("c", _)): _*
+      ) should containInAnyOrder(Seq(("a", 1.0), ("b", 2.5), ("c", 50.0)))
     }
   }
 
@@ -695,15 +853,6 @@ class PairSCollectionFunctionsTest extends PipelineSpec {
       val p2 = sc.parallelize(Seq[String]())
       val p = p1.subtractByKey(p2)
       p should containInAnyOrder(Seq(("a", 1), ("b", 2), ("c", 3), ("b", 4)))
-    }
-  }
-
-  it should "support sumByKey()" in {
-    runWithContext { sc =>
-      val p = sc
-        .parallelize(List(("a", 1), ("b", 2), ("b", 2)) ++ (1 to 100).map(("c", _)))
-        .sumByKey
-      p should containInAnyOrder(Seq(("a", 1), ("b", 4), ("c", 5050)))
     }
   }
 

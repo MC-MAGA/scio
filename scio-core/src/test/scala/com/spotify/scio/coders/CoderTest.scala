@@ -23,10 +23,11 @@ import com.spotify.scio.proto.OuterClassForProto
 import com.spotify.scio.testing.CoderAssertions._
 import com.spotify.scio.coders.instances._
 import com.spotify.scio.options.ScioOptions
+import com.test.ZstdTestCaseClass
 import com.twitter.algebird.Moments
 import org.apache.beam.sdk.{coders => beam}
 import org.apache.beam.sdk.coders.Coder.NonDeterministicException
-import org.apache.beam.sdk.coders.BigEndianLongCoder
+import org.apache.beam.sdk.coders.{BigEndianLongCoder, ZstdCoder}
 import org.apache.beam.sdk.options.{PipelineOptions, PipelineOptionsFactory}
 import org.apache.beam.sdk.util.SerializableUtils
 import org.apache.beam.sdk.extensions.protobuf.ByteStringCoder
@@ -38,14 +39,18 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.typelevel.scalaccompat.annotation.nowarn
 
-import scala.collection.{mutable => mut}
 import java.io.{ByteArrayInputStream, ObjectOutputStream, ObjectStreamClass}
 import java.nio.charset.Charset
 import java.time._
 import java.util.UUID
+
+import scala.collection.{mutable => mut}
+import scala.collection.compat._
+import scala.collection.immutable.SortedMap
 import scala.jdk.CollectionConverters._
 
 final class CoderTest extends AnyFlatSpec with Matchers {
+  import com.spotify.scio.coders.CoderTestUtils._
 
   val userId: UserId = UserId(Seq[Byte](1, 2, 3, 4))
   val user: User = User(userId, "johndoe", "johndoe@spotify.com")
@@ -120,22 +125,27 @@ final class CoderTest extends AnyFlatSpec with Matchers {
       materializeTo[MapCoder[_, _]] and
       beFullyCompliantNonDeterministic()
 
+    SortedMap.from(m) coderShould roundtrip() and
+      beOfType[CoderTransform[_, _]] and
+      materializeTo[SortedMapCoder[_, _]] and
+      beFullyCompliant()
+
     s.toSet coderShould roundtrip() and
       beOfType[CoderTransform[_, _]] and
       materializeTo[SetCoder[_]] and
       beFullyCompliantNonDeterministic()
 
-    mut.ListBuffer(1 to 10: _*) coderShould roundtrip() and
+    mut.ListBuffer.from(s) coderShould roundtrip() and
       beOfType[Transform[_, _]] and
       materializeToTransformOf[BufferCoder[_]] and
       beFullyCompliant()
 
-    BitSet(1 to 100000: _*) coderShould roundtrip() and
+    BitSet.fromSpecific(1 to 100000) coderShould roundtrip() and
       beOfType[Beam[_]] and
       materializeTo[BitSetCoder] and
       beFullyCompliant()
 
-    mut.Set(s: _*) coderShould roundtrip() and
+    mut.Set.from(s) coderShould roundtrip() and
       beOfType[CoderTransform[_, _]] and
       materializeTo[MutableSetCoder[_]] and
       beFullyCompliant()
@@ -543,6 +553,12 @@ final class CoderTest extends AnyFlatSpec with Matchers {
     )
   }
 
+  it should "derive when protobuf Any is in scope" in {
+    """import com.google.protobuf.Any
+      |Coder.gen[DummyCC]
+      |""".stripMargin should compile
+  }
+
   it should "support classes with private constructors" in {
     import com.spotify.scio.coders.kryo.{fallback => f}
     PrivateClass(42L) coderShould fallback() and materializeTo[KryoAtomicCoder[_]]
@@ -686,6 +702,36 @@ final class CoderTest extends AnyFlatSpec with Matchers {
     val coder = Coder.beam(bCoder)
     val materializedCoder = CoderMaterializer.beamWithDefault(coder, opts)
     materializedCoder shouldBe new MaterializedCoder[String](bCoder)
+  }
+
+  it should "derive zstd coders when configured" in {
+    val tmp = writeZstdBytes(Array[Byte](7, 6, 5, 4, 3, 2, 1, 0))
+    val opts = zstdOpts("com.test.ZstdTestCaseClass", s"file://${tmp.getAbsolutePath}")
+    ZstdTestCaseClass(1, "s", 10L) coder WithOptions(opts) should notFallback() and
+      beOfType[Ref[_]] and
+      materializeTo[ZstdCoder[_]] and
+      beFullyCompliant()
+  }
+
+  it should "derive a zstd coder for the value side of a 2-tuple" in {
+    val tmp = writeZstdBytes(Array[Byte](7, 6, 5, 4, 3, 2, 1, 0))
+    val opts = zstdOpts("com.test.ZstdTestCaseClass", s"file://${tmp.getAbsolutePath}")
+    ("Foo", ZstdTestCaseClass(1, "s", 10L)) coder WithOptions(opts) should notFallback() and
+      beOfType[CoderTransform[_, _]] and
+      materializeTo[Tuple2Coder[_, _]] and
+      beFullyCompliant() and { ctx =>
+        // casts checked in materializeTo
+        val valueCoder =
+          ctx.beamCoder.asInstanceOf[MaterializedCoder[_]].bcoder.asInstanceOf[Tuple2Coder[_, _]].bc
+        valueCoder shouldBe a[ZstdCoder[_]]
+      }
+  }
+
+  it should "not derive zstd coders when not configured" in {
+    ZstdTestCaseClass(1, "s", 10L) coderShould notFallback() and
+      beOfType[Ref[_]] and
+      materializeTo[RefCoder[_]] and
+      beFullyCompliant()
   }
 
   it should "have a useful stacktrace when a Coder throws" in {
@@ -858,6 +904,15 @@ final class CoderTest extends AnyFlatSpec with Matchers {
       classOf[magnolia1.SealedTrait[Coder, _]].getName,
       classOf[magnolia1.Subtype[Coder, _]].getName
     )
+  }
+
+  it should "not accept SortedMap when ordering doesn't match with coder" in {
+    val sm = SortedMap(1 -> "1", 2 -> "2")(Ordering[Int].reverse)
+    // implicit SortedMapCoder will use implicit default Int ordering
+    val e = the[IllegalArgumentException] thrownBy {
+      sm coderShould roundtrip()
+    }
+    e.getMessage shouldBe "requirement failed: SortedMap ordering does not match SortedMapCoder ordering"
   }
 
   /*

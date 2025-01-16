@@ -24,10 +24,10 @@ concurrency:
 
 jobs:
   build:
-    name: Build and Test
+    name: Test
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         scala: [2.13, 2.12]
         java: [corretto@11, corretto@17, corretto@21]
         exclude:
@@ -42,6 +42,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
 
       - name: Setup Java (corretto@11)
         id: setup-java-corretto-11
@@ -97,18 +100,18 @@ jobs:
         run: sbt githubWorkflowCheck
 
       - name: Check headers and formatting
-        if: matrix.java == 'corretto@11' && matrix.os == 'ubuntu-latest'
-        run: sbt '++ ${{ matrix.scala }}' headerCheckAll scalafmtCheckAll 'project /' scalafmtSbtCheck
+        if: matrix.java == 'corretto@11' && matrix.os == 'ubuntu-22.04'
+        run: sbt '++ ${{ matrix.scala }}' headerCheckAll javafmtCheckAll scalafmtCheckAll 'project /' scalafmtSbtCheck
 
       - name: Test
         run: sbt '++ ${{ matrix.scala }}' test
 
       - name: Check binary compatibility
-        if: matrix.java == 'corretto@11' && matrix.os == 'ubuntu-latest'
+        if: matrix.java == 'corretto@11' && matrix.os == 'ubuntu-22.04'
         run: sbt '++ ${{ matrix.scala }}' mimaReportBinaryIssues
 
       - name: Generate API documentation
-        if: matrix.java == 'corretto@11' && matrix.os == 'ubuntu-latest'
+        if: matrix.java == 'corretto@11' && matrix.os == 'ubuntu-22.04'
         run: sbt '++ ${{ matrix.scala }}' doc
 
       - name: Check dependencies
@@ -116,11 +119,11 @@ jobs:
 
       - name: Make target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: mkdir -p integration/target scio-tensorflow/target site/target scio-cassandra/cassandra3/target scio-jmh/target scio-elasticsearch/es8/target scio-jdbc/target scio-macros/target scio-grpc/target scio-elasticsearch/common/target scio-test/target scio-avro/target scio-elasticsearch/es7/target scio-redis/target scio-extra/target scio-test/parquet/target scio-test/core/target scio-google-cloud-platform/target scio-smb/target scio-test/google-cloud-platform/target scio-neo4j/target scio-parquet/target scio-core/target scio-repl/target project/target
+        run: mkdir -p scio-bom/target scio-tensorflow/target site/target scio-cassandra/cassandra3/target scio-elasticsearch/es8/target scio-jdbc/target scio-macros/target scio-grpc/target scio-elasticsearch/common/target scio-test/target scio-avro/target scio-elasticsearch/es7/target scio-snowflake/target scio-redis/target scio-extra/target scio-test/parquet/target scio-test/core/target scio-google-cloud-platform/target scio-smb/target scio-test/google-cloud-platform/target scio-neo4j/target scio-parquet/target scio-core/target scio-repl/target project/target
 
       - name: Compress target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: tar cf targets.tar integration/target scio-tensorflow/target site/target scio-cassandra/cassandra3/target scio-jmh/target scio-elasticsearch/es8/target scio-jdbc/target scio-macros/target scio-grpc/target scio-elasticsearch/common/target scio-test/target scio-avro/target scio-elasticsearch/es7/target scio-redis/target scio-extra/target scio-test/parquet/target scio-test/core/target scio-google-cloud-platform/target scio-smb/target scio-test/google-cloud-platform/target scio-neo4j/target scio-parquet/target scio-core/target scio-repl/target project/target
+        run: tar cf targets.tar scio-bom/target scio-tensorflow/target site/target scio-cassandra/cassandra3/target scio-elasticsearch/es8/target scio-jdbc/target scio-macros/target scio-grpc/target scio-elasticsearch/common/target scio-test/target scio-avro/target scio-elasticsearch/es7/target scio-snowflake/target scio-redis/target scio-extra/target scio-test/parquet/target scio-test/core/target scio-google-cloud-platform/target scio-smb/target scio-test/google-cloud-platform/target scio-neo4j/target scio-parquet/target scio-core/target scio-repl/target project/target
 
       - name: Upload target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
@@ -135,7 +138,7 @@ jobs:
     if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         java: [corretto@11]
     runs-on: ${{ matrix.os }}
     steps:
@@ -143,6 +146,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
 
       - name: Setup Java (corretto@11)
         id: setup-java-corretto-11
@@ -238,10 +244,10 @@ jobs:
 
   dependency-submission:
     name: Submit Dependencies
-    if: github.event_name != 'pull_request'
+    if: github.event.repository.fork == false && github.event_name != 'pull_request'
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         java: [corretto@11]
     runs-on: ${{ matrix.os }}
     steps:
@@ -249,6 +255,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
 
       - name: Setup Java (corretto@11)
         id: setup-java-corretto-11
@@ -292,14 +301,14 @@ jobs:
       - name: Submit Dependencies
         uses: scalacenter/sbt-dependency-submission@v2
         with:
-          modules-ignore: scio_2.13 scio_2.12 scio-examples_2.13 scio-examples_2.12
+          modules-ignore: scio_2.13 scio_2.12 scio-examples_2.13 scio-examples_2.12 integration_2.13 integration_2.12 scio-jmh_2.13 scio-jmh_2.12
           configs-ignore: test scala-tool scala-doc-tool test-internal
 
   validate-steward:
     name: Validate Steward Config
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         java: [temurin@11]
     runs-on: ${{ matrix.os }}
     steps:
@@ -324,7 +333,7 @@ jobs:
     name: Test Coverage
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         scala: [2.13]
         java: [corretto@11]
     runs-on: ${{ matrix.os }}
@@ -354,16 +363,49 @@ jobs:
         run: sbt '++ ${{ matrix.scala }}' coverage test coverageAggregate
 
       - name: Upload coverage report
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  avro-legacy:
+    name: Test Legacy Avro
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        os: [ubuntu-22.04]
+        scala: [2.13]
+        java: [corretto@11]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout current branch (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java (corretto@11)
+        id: setup-java-corretto-11
+        if: matrix.java == 'corretto@11'
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: 11
+          cache: sbt
+
+      - name: sbt update
+        if: matrix.java == 'corretto@11' && steps.setup-java-corretto-11.outputs.cache-hit == 'false'
+        run: sbt +update
+
+      - name: Test
+        env:
+          JAVA_OPTS: '-Davro.version=1.8.2'
+        run: sbt '++ ${{ matrix.scala }}' scio-avro/test
 
   it-test:
     name: Integration Test
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         scala: [2.13]
         java: [corretto@11]
     runs-on: ${{ matrix.os }}
@@ -411,7 +453,7 @@ jobs:
     if: (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         scala: [2.13]
         java: [corretto@11]
     runs-on: ${{ matrix.os }}

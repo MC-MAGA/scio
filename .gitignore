@@ -28,8 +28,10 @@ project/plugins/project/
 .metals/
 metals.sbt
 .vscode/
+*.iml
 
 # scio
 .bigquery/
 .scio_repl
 *.jfr
+scio-bom/

@@ -33,11 +33,10 @@ import com.spotify.scio.testing.TestDataManager
 import com.spotify.scio.transforms.BatchDoFn
 import com.spotify.scio.util.FilenamePolicySupplier
 import com.spotify.scio.util._
-import com.spotify.scio.util.random.{BernoulliSampler, PoissonSampler}
 import com.twitter.algebird.{Aggregator, Monoid, MonoidAggregator, Semigroup}
 import org.apache.beam.sdk.coders.{ByteArrayCoder, Coder => BCoder}
 import org.apache.beam.sdk.schemas.SchemaCoder
-import org.apache.beam.sdk.io.Compression
+import org.apache.beam.sdk.io.{Compression, FileBasedSource}
 import org.apache.beam.sdk.io.FileIO.ReadMatches.DirectoryTreatment
 import org.apache.beam.sdk.transforms.DoFn.{Element, OutputReceiver, ProcessElement, Timestamp}
 import org.apache.beam.sdk.transforms._
@@ -46,7 +45,7 @@ import org.apache.beam.sdk.util.{CoderUtils, SerializableUtils}
 import org.apache.beam.sdk.values.WindowingStrategy.AccumulationMode
 import org.apache.beam.sdk.values._
 import org.apache.beam.sdk.{io => beam}
-import org.joda.time.{Duration, Instant}
+import org.joda.time.{Duration, Instant, ReadableInstant}
 import org.slf4j.LoggerFactory
 
 import scala.jdk.CollectionConverters._
@@ -55,7 +54,6 @@ import scala.collection.immutable.TreeMap
 import scala.reflect.ClassTag
 import scala.util.Try
 import com.twitter.chill.ClosureCleaner
-import org.apache.beam.sdk.util.common.ElementByteSizeObserver
 import org.typelevel.scalaccompat.annotation.{nowarn, unused}
 
 /** Convenience functions for creating SCollections. */
@@ -384,11 +382,8 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    * @group collection
    */
   def partitionByKey[U](partitionKeys: Set[U])(f: T => U): Map[U, SCollection[T]] = {
-    val partitionKeysIndexed = partitionKeys.toIndexedSeq
-
-    partitionKeysIndexed
-      .zip(partition(partitionKeys.size, (t: T) => partitionKeysIndexed.indexOf(f(t))))
-      .toMap
+    val partitions = partitionKeys.zipWithIndex.toMap
+    partitionKeys.zip(partition(partitionKeys.size, x => partitions(f(x)))).toMap
   }
 
   /**
@@ -489,21 +484,8 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   def batchByteSized(
     batchByteSize: Long,
     maxLiveWindows: Int = BatchDoFn.DEFAULT_MAX_LIVE_WINDOWS
-  ): SCollection[Iterable[T]] = {
-    val bCoder = CoderMaterializer.beam(context, coder)
-    val weigher = Functions.serializableFn[T, java.lang.Long] { e =>
-      var size: Long = 0L
-      val observer = new ElementByteSizeObserver {
-        override def reportElementSize(elementByteSize: Long): Unit = size += elementByteSize
-      }
-      bCoder.registerByteSizeObserver(e, observer)
-      observer.advance()
-      size
-    }
-    this
-      .parDo(new BatchDoFn[T](batchByteSize, weigher, maxLiveWindows))(Coder.aggregate)
-      .map(_.asScala)
-  }
+  ): SCollection[Iterable[T]] =
+    batchWeighted(batchByteSize, ScioUtil.elementByteSize(context), maxLiveWindows)
 
   /**
    * Batches elements for amortized processing. Elements are batched per-window and batches emitted
@@ -525,7 +507,7 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
     cost: T => Long,
     maxLiveWindows: Int = BatchDoFn.DEFAULT_MAX_LIVE_WINDOWS
   ): SCollection[Iterable[T]] = {
-    val weigher = Functions.serializableFn(cost.andThen(_.asInstanceOf[java.lang.Long]))
+    val weigher = Functions.serializableFn(cost.andThen(Long.box))
     this
       .parDo(new BatchDoFn[T](batchWeight, weigher, maxLiveWindows))(Coder.aggregate)
       .map(_.asScala)
@@ -789,6 +771,16 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   def map[U: Coder](f: T => U): SCollection[U] = this.parDo(Functions.mapFn(f))
 
   /**
+   * Return the min of this SCollection as defined by the implicit `Ordering[T]`.
+   * @return
+   *   a new SCollection with the minimum element
+   * @group transform
+   */
+  // Scala lambda is simpler and more powerful than transforms.Min
+  def min(implicit ord: Ordering[T]): SCollection[T] =
+    this.reduce(ord.min)
+
+  /**
    * Return the max of this SCollection as defined by the implicit `Ordering[T]`.
    * @return
    *   a new SCollection with the maximum element
@@ -799,6 +791,29 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
     this.reduce(ord.max)
 
   /**
+   * Return the latest of this SCollection according to its event time.
+   * @return
+   *   a new SCollection with the latest element
+   * @group transform
+   */
+  def latest: SCollection[T] =
+    // widen to ReadableInstant for scala 2.12 implicit ordering
+    this.withTimestamp.max(Ordering.by(_._2: ReadableInstant)).keys
+
+  /**
+   * Reduce with [[com.twitter.algebird.Semigroup Semigroup]]. This could be more powerful and
+   * better optimized than [[reduce]] in some cases.
+   * @group transform
+   */
+  def sum(implicit sg: Semigroup[T]): SCollection[T] = {
+    SCollection.logger.warn(
+      "combine/sum does not support default value and may fail in some streaming scenarios. " +
+        "Consider aggregate/fold instead."
+    )
+    this.pApply(Combine.globally(Functions.reduceFn(context, sg)).withoutDefaults())
+  }
+
+  /**
    * Return the mean of this SCollection as defined by the implicit `Numeric[T]`.
    * @return
    *   a new SCollection with the mean of elements
@@ -806,21 +821,10 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    */
   def mean(implicit ev: Numeric[T]): SCollection[Double] = this.transform { in =>
     val e = ev // defeat closure
-    in.map(e.toDouble)
-      .asInstanceOf[SCollection[JDouble]]
-      .pApply(Mean.globally())
+    in.map[JDouble](e.toDouble)
+      .pApply(Mean.globally().withoutDefaults())
       .asInstanceOf[SCollection[Double]]
   }
-
-  /**
-   * Return the min of this SCollection as defined by the implicit `Ordering[T]`.
-   * @return
-   *   a new SCollection with the minimum element
-   * @group transform
-   */
-  // Scala lambda is simpler and more powerful than transforms.Min
-  def min(implicit ord: Ordering[T]): SCollection[T] =
-    this.reduce(ord.min)
 
   /**
    * Compute the SCollection's data distribution using approximate `N`-tiles.
@@ -916,9 +920,17 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    *   a new SCollection whose single value is an `Iterable` of the samples
    * @group transform
    */
-  def sample(sampleSize: Int): SCollection[Iterable[T]] = this.transform {
-    _.pApply(Sample.fixedSizeGlobally(sampleSize)).map(_.asScala)
-  }
+  // TODO move to implicit
+  def sample(sampleSize: Int): SCollection[Iterable[T]] =
+    new SampleSCollectionFunctions(this).sample(sampleSize)
+
+  // TODO move to implicit
+  def sampleWeighted(totalWeight: Long, cost: T => Long): SCollection[Iterable[T]] =
+    new SampleSCollectionFunctions(this).sampleWeighted(totalWeight, cost)
+
+  // TODO move to implicit
+  def sampleByteSized(totalByteSize: Long): SCollection[Iterable[T]] =
+    new SampleSCollectionFunctions(this).sampleByteSized(totalByteSize)
 
   /**
    * Return a sampled subset of this SCollection. Does not trigger shuffling.
@@ -930,12 +942,9 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    *   the sampling fraction
    * @group transform
    */
+  // TODO move to implicit
   def sample(withReplacement: Boolean, fraction: Double): SCollection[T] =
-    if (withReplacement) {
-      this.parDo(new PoissonSampler[T](fraction))
-    } else {
-      this.parDo(new BernoulliSampler[T](fraction))
-    }
+    new SampleSCollectionFunctions(this).sample(withReplacement, fraction)
 
   /**
    * Return an SCollection with the elements from `this` that are not in `other`.
@@ -945,19 +954,6 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
     this.transform {
       _.map((_, ())).subtractByKey(that).keys
     }
-
-  /**
-   * Reduce with [[com.twitter.algebird.Semigroup Semigroup]]. This could be more powerful and
-   * better optimized than [[reduce]] in some cases.
-   * @group transform
-   */
-  def sum(implicit sg: Semigroup[T]): SCollection[T] = {
-    SCollection.logger.warn(
-      "combine/sum does not support default value and may fail in some streaming scenarios. " +
-        "Consider aggregate/fold instead."
-    )
-    this.pApply(Combine.globally(Functions.reduceFn(context, sg)).withoutDefaults())
-  }
 
   /**
    * Return a sampled subset of any `num` elements of the SCollection.
@@ -972,11 +968,9 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    *   a new SCollection whose single value is an `Iterable` of the top k
    * @group transform
    */
-  def top(
-    num: Int
-  )(implicit ord: Ordering[T]): SCollection[Iterable[T]] =
+  def top(num: Int)(implicit ord: Ordering[T]): SCollection[Iterable[T]] =
     this.transform {
-      _.pApply(Top.of(num, ord)).map((l: JIterable[T]) => l.asScala)
+      _.pApply(Top.of[T, Ordering[T]](num, ord)).map((l: JIterable[T]) => l.asScala)
     }
 
   // =======================================================================
@@ -1359,14 +1353,8 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   // Read operations
   // =======================================================================
 
-  /**
-   * Reads each file, represented as a pattern, in this [[SCollection]].
-   *
-   * @return
-   *   each line of the input files.
-   * @see
-   *   [[readFilesAsBytes]], [[readFilesAsString]]
-   */
+  /** @deprecated Use readTextFiles */
+  @deprecated("Use readTextFiles", "0.14.5")
   def readFiles(implicit ev: T <:< String): SCollection[String] =
     readFiles(beam.TextIO.readFiles())
 
@@ -1374,23 +1362,28 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    * Reads each file, represented as a pattern, in this [[SCollection]].
    *
    * @return
+   *   each line of the input files.
+   */
+  def readTextFiles(implicit ev: T <:< String): SCollection[String] =
+    new FileSCollectionFunctions(this.covary_).readTextFiles()
+
+  /**
+   * Reads each file, represented as a pattern, in this [[SCollection]].
+   *
+   * @return
    *   each file fully read as [[Array[Byte]].
-   * @see
-   *   [[readFilesAsBytes]], [[readFilesAsString]]
    */
   def readFilesAsBytes(implicit ev: T <:< String): SCollection[Array[Byte]] =
-    readFiles(_.readFullyAsBytes())
+    new FileSCollectionFunctions(this.covary_).readFilesAsBytes()
 
   /**
    * Reads each file, represented as a pattern, in this [[SCollection]].
    *
    * @return
    *   each file fully read as [[String]].
-   * @see
-   *   [[readFilesAsBytes]], [[readFilesAsString]]
    */
   def readFilesAsString(implicit ev: T <:< String): SCollection[String] =
-    readFiles(_.readFullyAsUTF8String())
+    new FileSCollectionFunctions(this.covary_).readFilesAsString()
 
   /**
    * Reads each file, represented as a pattern, in this [[SCollection]].
@@ -1401,7 +1394,7 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   def readFiles[A: Coder](
     f: beam.FileIO.ReadableFile => A
   )(implicit ev: T <:< String): SCollection[A] =
-    readFiles(DirectoryTreatment.SKIP, Compression.AUTO)(f)
+    new FileSCollectionFunctions(this.covary_).readFiles(f)
 
   /**
    * Reads each file, represented as a pattern, in this [[SCollection]].
@@ -1416,13 +1409,27 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    */
   def readFiles[A: Coder](directoryTreatment: DirectoryTreatment, compression: Compression)(
     f: beam.FileIO.ReadableFile => A
-  )(implicit ev: T <:< String): SCollection[A] = {
-    val transform =
-      ParDo
-        .of(Functions.mapFn[beam.FileIO.ReadableFile, A](f))
-        .asInstanceOf[PTransform[PCollection[beam.FileIO.ReadableFile], PCollection[A]]]
-    readFiles(transform, directoryTreatment, compression)
-  }
+  )(implicit ev: T <:< String): SCollection[A] =
+    new FileSCollectionFunctions(this.covary_).readFiles(directoryTreatment, compression)(f)
+
+  /**
+   * Reads each file, represented as a pattern, in this [[SCollection]]. Files are split into
+   * multiple offset ranges and read with the [[FileBasedSource]].
+   *
+   * @param desiredBundleSizeBytes
+   *   Desired size of bundles read by the sources.
+   * @param directoryTreatment
+   *   Controls how to handle directories in the input.
+   * @param compression
+   *   Reads files using the given [[org.apache.beam.sdk.io.Compression]].
+   */
+  def readFiles[A: Coder](
+    desiredBundleSizeBytes: Long,
+    directoryTreatment: DirectoryTreatment,
+    compression: Compression
+  )(f: String => FileBasedSource[A])(implicit ev: T <:< String): SCollection[A] =
+    new FileSCollectionFunctions(this.covary_)
+      .readFiles(desiredBundleSizeBytes, directoryTreatment, compression)(f)
 
   /**
    * Reads each file, represented as a pattern, in this [[SCollection]].
@@ -1436,29 +1443,58 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    *   Reads files using the given [[org.apache.beam.sdk.io.Compression]].
    */
   def readFiles[A: Coder](
-    filesTransform: PTransform[PCollection[beam.FileIO.ReadableFile], PCollection[A]],
+    filesTransform: PTransform[_ >: PCollection[beam.FileIO.ReadableFile], PCollection[A]],
     directoryTreatment: DirectoryTreatment = DirectoryTreatment.SKIP,
     compression: Compression = Compression.AUTO
   )(implicit ev: T <:< String): SCollection[A] =
-    if (context.isTest) {
-      val id = context.testId.get
-      this.flatMap(s => TestDataManager.getInput(id)(ReadIO[A](ev(s))).asIterable.get)
-    } else {
-      this
-        .covary_[String]
-        .applyTransform(new PTransform[PCollection[String], PCollection[A]]() {
-          override def expand(input: PCollection[String]): PCollection[A] =
-            input
-              .apply(beam.FileIO.matchAll())
-              .apply(
-                beam.FileIO
-                  .readMatches()
-                  .withCompression(compression)
-                  .withDirectoryTreatment(directoryTreatment)
-              )
-              .apply(filesTransform)
-        })
-    }
+    new FileSCollectionFunctions(this.covary_)
+      .readFiles(filesTransform, directoryTreatment, compression)
+
+  /**
+   * Reads each file, represented as a pattern, in this [[SCollection]]. Files are split into
+   * multiple offset ranges and read with the [[FileBasedSource]].
+   *
+   * @return
+   *   origin file name paired with read line.
+   *
+   * @param desiredBundleSizeBytes
+   *   Desired size of bundles read by the sources.
+   * @param directoryTreatment
+   *   Controls how to handle directories in the input.
+   * @param compression
+   *   Reads files using the given [[org.apache.beam.sdk.io.Compression]].
+   */
+  def readTextFilesWithPath(
+    desiredBundleSizeBytes: Long = FileSCollectionFunctions.DefaultBundleSizeBytes,
+    directoryTreatment: DirectoryTreatment = DirectoryTreatment.SKIP,
+    compression: Compression = Compression.AUTO
+  )(implicit ev: T <:< String): SCollection[(String, String)] =
+    new FileSCollectionFunctions(this.covary_)
+      .readTextFilesWithPath(desiredBundleSizeBytes, directoryTreatment, compression)
+
+  /**
+   * Reads each file, represented as a pattern, in this [[SCollection]]. Files are split into
+   * multiple offset ranges and read with the [[FileBasedSource]].
+   *
+   * @return
+   *   origin file name paired with read element.
+   *
+   * @param desiredBundleSizeBytes
+   *   Desired size of bundles read by the sources.
+   * @param directoryTreatment
+   *   Controls how to handle directories in the input.
+   * @param compression
+   *   Reads files using the given [[org.apache.beam.sdk.io.Compression]].
+   */
+  def readFilesWithPath[A: Coder](
+    desiredBundleSizeBytes: Long = FileSCollectionFunctions.DefaultBundleSizeBytes,
+    directoryTreatment: DirectoryTreatment = DirectoryTreatment.SKIP,
+    compression: Compression = Compression.AUTO
+  )(
+    f: String => FileBasedSource[A]
+  )(implicit ev: T <:< String): SCollection[(String, A)] =
+    new FileSCollectionFunctions(this.covary_)
+      .readFilesWithPath(desiredBundleSizeBytes, directoryTreatment, compression)(f)
 
   /**
    * Pairs each element with the value of the provided [[SideInput]] in the element's window.
@@ -1646,6 +1682,42 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
             filenamePolicySupplier
           )
       )
+
+  /**
+   * Creates a Zstd dictionary based on this SCollection targeting a dictionary of size
+   * `zstdDictSizeBytes` to be trained with approximately `trainingBytesTarget` bytes. The exact
+   * training size is determined by estimating the average element size with
+   * `numElementsForSizeEstimation` encoded elements and sampling this SCollection at an appropriate
+   * rate.
+   *
+   * @param path
+   *   The path to which the trained dictionary should be written.
+   * @param zstdDictSizeBytes
+   *   The size of the dictionary to train in bytes. Recommended dictionary sizes are in hundreds of
+   *   KB. Over 10MB is not recommended and you may hit resource limits if the dictionary size is
+   *   near 20MB.
+   * @param numElementsForSizeEstimation
+   *   The number of elements of the SCollection to use to estimate the average element size.
+   * @param trainingBytesTarget
+   *   The target number of bytes on which to train. Memory usage for training can be 10x this.
+   *   `None` to infer from `zstdDictSizeBytes`. Must be able to fit in the memory of a single
+   *   worker.
+   */
+  def saveAsZstdDictionary(
+    path: String,
+    zstdDictSizeBytes: Int = ZstdDictIO.WriteParam.DefaultZstdDictSizeBytes,
+    numElementsForSizeEstimation: Long = ZstdDictIO.WriteParam.DefaultNumElementsForSizeEstimation,
+    trainingBytesTarget: Option[Int] = ZstdDictIO.WriteParam.DefaultTrainingBytesTarget
+  ): ClosedTap[Nothing] = {
+    this
+      .write(ZstdDictIO[T](path))(
+        ZstdDictIO.WriteParam(
+          zstdDictSizeBytes,
+          numElementsForSizeEstimation,
+          trainingBytesTarget
+        )
+      )
+  }
 
   /**
    * Save this SCollection with a custom output transform. The transform should have a unique name.

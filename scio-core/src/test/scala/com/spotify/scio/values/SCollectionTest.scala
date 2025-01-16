@@ -22,7 +22,6 @@ import java.nio.file.Files
 import com.spotify.scio.ScioContext
 import com.spotify.scio.testing.PipelineSpec
 import com.spotify.scio.util.MockedPrintStream
-import com.spotify.scio.util.random.RandomSamplerUtils
 import com.twitter.algebird.{Aggregator, Semigroup}
 import org.apache.beam.sdk.transforms.DoFn.ProcessElement
 import org.apache.beam.sdk.transforms.{Count, DoFn, GroupByKey, ParDo}
@@ -41,6 +40,7 @@ import scala.jdk.CollectionConverters._
 import com.spotify.scio.coders.{Beam, Coder, MaterializedCoder}
 import com.spotify.scio.options.ScioOptions
 import com.spotify.scio.schemas.Schema
+import org.apache.beam.sdk.Pipeline.PipelineExecutionException
 import org.apache.beam.sdk.coders.{NullableCoder, StringUtf8Coder}
 
 import java.nio.charset.StandardCharsets
@@ -250,6 +250,16 @@ class SCollectionTest extends PipelineSpec {
       m("b") should containInAnyOrder(Seq("b4", "b5"))
       m("c") should containInAnyOrder(Seq("c6"))
     }
+
+    val e = the[PipelineExecutionException] thrownBy {
+      runWithContext { sc =>
+        sc
+          .parallelize(Seq("x"))
+          .partitionByKey(Set("a", "b", "c"))(_.substring(0, 1))
+      }
+    }
+    e.getCause shouldBe a[NoSuchElementException]
+    e.getCause.getMessage shouldBe "key not found: x"
   }
 
   it should "support hashPartition() based on Object.hashCode()" in {
@@ -495,10 +505,23 @@ class SCollectionTest extends PipelineSpec {
     }
   }
 
+  it should "support min" in {
+    runWithContext { sc =>
+      def min[T: Coder: Numeric](elems: T*): SCollection[T] =
+        sc.parallelize(elems).min
+      min[Int]() should beEmpty
+      min(1, 2, 3) should containSingleValue(1)
+      min(1L, 2L, 3L) should containSingleValue(1L)
+      min(1f, 2f, 3f) should containSingleValue(1f)
+      min(1.0, 2.0, 3.0) should containSingleValue(1.0)
+    }
+  }
+
   it should "support max" in {
     runWithContext { sc =>
       def max[T: Coder: Numeric](elems: T*): SCollection[T] =
         sc.parallelize(elems).max
+      max[Int]() should beEmpty
       max(1, 2, 3) should containSingleValue(3)
       max(1L, 2L, 3L) should containSingleValue(3L)
       max(1f, 2f, 3f) should containSingleValue(3f)
@@ -506,25 +529,37 @@ class SCollectionTest extends PipelineSpec {
     }
   }
 
+  it should "support latest" in {
+    runWithContext { sc =>
+      def latest(elems: Long*): SCollection[Long] =
+        sc.parallelize(elems).timestampBy(Instant.ofEpochMilli).latest
+      latest() should beEmpty
+      latest(1L, 2L, 3L) should containSingleValue(3L)
+    }
+  }
+
+  it should "support sum" in {
+    runWithContext { sc =>
+      def sum[T: Coder: Semigroup](elems: T*): SCollection[T] =
+        sc.parallelize(elems).sum
+      sum[Int]() should beEmpty
+      sum(1, 2, 3) should containSingleValue(6)
+      sum(1L, 2L, 3L) should containSingleValue(6L)
+      sum(1f, 2f, 3f) should containSingleValue(6f)
+      sum(1.0, 2.0, 3.0) should containSingleValue(6.0)
+      sum(1 to 100: _*) should containSingleValue(5050)
+    }
+  }
+
   it should "support mean" in {
     runWithContext { sc =>
       def mean[T: Coder: Numeric](elems: T*): SCollection[Double] =
         sc.parallelize(elems).mean
+      mean[Int]() should beEmpty
       mean(1, 2, 3) should containSingleValue(2.0)
       mean(1L, 2L, 3L) should containSingleValue(2.0)
       mean(1f, 2f, 3f) should containSingleValue(2.0)
       mean(1.0, 2.0, 3.0) should containSingleValue(2.0)
-    }
-  }
-
-  it should "support min" in {
-    runWithContext { sc =>
-      def min[T: Coder: Numeric](elems: T*): SCollection[T] =
-        sc.parallelize(elems).min
-      min(1, 2, 3) should containSingleValue(1)
-      min(1L, 2L, 3L) should containSingleValue(1L)
-      min(1f, 2f, 3f) should containSingleValue(1f)
-      min(1.0, 2.0, 3.0) should containSingleValue(1.0)
     }
   }
 
@@ -566,34 +601,6 @@ class SCollectionTest extends PipelineSpec {
     }
   }
 
-  it should "support sample()" in {
-    runWithContext { sc =>
-      val p = sc.parallelize(Seq(1, 1, 1, 1, 1))
-      val r1 = p.sample(1)
-      val r2 = p.sample(5)
-      r1 should containSingleValue(Iterable(1))
-      r2 should containSingleValue(Iterable(1, 1, 1, 1, 1))
-    }
-  }
-
-  it should "support sample() with replacement" in {
-    import RandomSamplerUtils._
-    for (fraction <- List(0.05, 0.2, 1.0)) {
-      val sample = runWithData(population)(_.sample(true, fraction))
-      (sample.size.toDouble / populationSize) shouldBe fraction +- 0.05
-      sample.toSet.size should be < sample.size
-    }
-  }
-
-  it should "support sample() without replacement" in {
-    import RandomSamplerUtils._
-    for (fraction <- List(0.05, 0.2, 1.0)) {
-      val sample = runWithData(population)(_.sample(false, fraction))
-      (sample.size.toDouble / populationSize) shouldBe fraction +- 0.05
-      sample.toSet.size shouldBe sample.size
-    }
-  }
-
   it should "support subtract()" in {
     runWithContext { sc =>
       val p1 = sc.parallelize(Seq(1, 2, 3, 4, 5))
@@ -609,18 +616,6 @@ class SCollectionTest extends PipelineSpec {
       val p2 = sc.parallelize(Seq(2, 4, 6, 8, 10))
       val p = p1.subtract(p2)
       p should containInAnyOrder(Seq(1, 3, 5, 1, 3, 5))
-    }
-  }
-
-  it should "support sum" in {
-    runWithContext { sc =>
-      def sum[T: Coder: Semigroup](elems: T*): SCollection[T] =
-        sc.parallelize(elems).sum
-      sum(1, 2, 3) should containSingleValue(6)
-      sum(1L, 2L, 3L) should containSingleValue(6L)
-      sum(1f, 2f, 3f) should containSingleValue(6f)
-      sum(1.0, 2.0, 3.0) should containSingleValue(6.0)
-      sum(1 to 100: _*) should containSingleValue(5050)
     }
   }
 
@@ -949,5 +944,4 @@ class SCollectionTest extends PipelineSpec {
       coll should containInAnyOrder(Seq(Seq.empty[Int]))
     }
   }
-
 }
